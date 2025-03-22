@@ -15,6 +15,7 @@ import psutil
 import os  # Add os import
 from queue import Queue
 from threading import Thread
+import easyocr  # Add this import
 
 # import face_recognition  # Add at top with other imports
 global _results
@@ -26,6 +27,8 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
 
 # Add sound settings
 SOUND_COOLDOWN = 2.0  # seconds between sound alerts
@@ -45,8 +48,8 @@ except ImportError:
     GPIO = None
 
 # Optimization settings for Raspberry Pi
-FRAME_WIDTH = 320  # Further reduced from 416
-FRAME_HEIGHT = 240  # Further reduced from 320
+FRAME_WIDTH = 768  # Further reduced from 416
+FRAME_HEIGHT = 576  # Further reduced from 320
 FRAME_RATE = 5  # Further reduced from 10
 SKIP_FRAMES = 3  # Process every 3rd frame
 MAX_OBJECTS = 5  # Limit number of objects to track
@@ -80,17 +83,44 @@ FACE_SETTINGS = {
     'announcement_cooldown': 5.0      # Seconds between face announcements
 }
 
+# Add text recognition settings after other settings
+TEXT_RECOGNITION_SETTINGS = {
+    'languages': ['en'],
+    'gpu': torch.cuda.is_available(),
+    'min_confidence': 0.4,  # Increased confidence threshold
+    'announcement_cooldown': 2.0,
+    'min_text_size': 15,    # Reduced minimum size
+    'max_text_length': 100, # Maximum text length to process
+    'rotation_angles': [0, -90, 90], # Check different orientations
+    'block_merge_threshold': 10,  # Pixels between text blocks to merge
+    'book_mode': {
+        'min_text_height': 20,      # Minimum text height for book text
+        'line_spacing': 10,         # Expected spacing between text lines
+        'page_margin': 30,          # Margin from edges to detect page boundaries
+        'reading_direction': 'top-down'  # Reading direction for book text
+    }
+}
+
 # Add spatial audio feedback
 def init_audio():
     pygame.mixer.init()
     pygame.mixer.set_num_channels(8)
     audio_path = "assets/audio"
-    return {
-
-        'warning': pygame.mixer.Sound(f"{audio_path}/warning.wav"),
-        'proximity': pygame.mixer.Sound(f"{audio_path}/proximity.wav"),
-        'direction': pygame.mixer.Sound(f"{audio_path}/direction.wav")
+    sounds = {}
+    sound_files = {
+        'warning': 'warning.wav',
+        'proximity': 'proximity.wav',
+        'direction': 'direction.wav'
     }
+    
+    for sound_name, file_name in sound_files.items():
+        try:
+            sounds[sound_name] = pygame.mixer.Sound(f"{audio_path}/{file_name}")
+        except FileNotFoundError:
+            print(f"Warning: Audio file {file_name} not found in {audio_path}")
+            sounds[sound_name] = None
+    
+    return sounds
 
 # Move global declarations to top level
 _frame = None
@@ -227,7 +257,7 @@ def analyze_path_clearance(frame_width, detected_objects):
     }
     
     zone_clearances = {zone: float('inf') for zone in zones.keys()}
-    
+
     for obj, distance, position, _ in detected_objects:
         x_center = position[0]  # Assuming position now returns (x_center, distance)
         # Check which zone the object is in
@@ -279,6 +309,9 @@ class VoiceCommandHandler:
             print(f"Warning: Could not initialize audio feedback: {e}")
             self.feedback_sounds = None
 
+        self.text_recognition_active = False
+        self.read_mode_active = False  # Add this line
+
     def _play_feedback(self, sound_type):
         if self.feedback_sounds and sound_type in self.feedback_sounds:
             try:
@@ -293,14 +326,12 @@ class VoiceCommandHandler:
         
     def _continuous_listen(self):
         with sr.Microphone() as source:
-            # Adjust for ambient noise
             print("Calibrating for ambient noise...")
             self.recognizer.adjust_for_ambient_noise(source, duration=2)
             print("Voice command system ready!")
             
             while not self.stop_event.is_set():
                 try:
-                    # Continuous listening with shorter timeout
                     audio = self.recognizer.listen(source, phrase_time_limit=2)
                     command = self.recognizer.recognize_google(audio).lower()
                     
@@ -318,6 +349,17 @@ class VoiceCommandHandler:
                         self.command_queue.put(("action", "clearance"))
                     if any(word in command for word in ["navigate", "navigation", "guide me"]):
                         self.command_queue.put(("mode", "navigation"))
+                    # Add text recognition commands
+                    if any(phrase in command for phrase in ["read text", "read this", "what does it say"]):
+                        self.command_queue.put(("action", "read_text"))
+                        self._play_feedback('command_recognized')
+                    if any(word in command for word in ["read", "reading", "start reading"]):
+                        self.command_queue.put(("mode", "read"))
+                        self._play_feedback('command_recognized')
+                    # Add book reading commands
+                    if any(phrase in command for phrase in ["read book", "start reading book"]):
+                        self.command_queue.put(("mode", "book"))
+                        self._play_feedback('command_recognized')
                     
                 except sr.WaitTimeoutError:
                     continue
@@ -350,16 +392,17 @@ tts_engine.setProperty('rate', 150)
 def load_optimized_model():
     try:
         if IS_RASPBERRY_PI:
-            model = YOLO('yolov8n.pt', task='detect')  # Explicitly set task
+            model = YOLO('yolov8n.pt')
             model.cpu()
-            torch.set_num_threads(1)  # Limit to single thread on Pi
-            # Force model to half precision
+            torch.set_num_threads(1)
             model.model.half()
             torch.set_default_tensor_type(torch.HalfTensor)
         else:
-            model = YOLO('yolov8n.pt', task='detect')
+            model = YOLO('yolov8n.pt')
             if torch.cuda.is_available():
-                model.cuda()
+                model.to('cuda')
+            else:
+                model.cpu()
         return model
     except Exception as e:
         logger.error(f"Error loading model: {e}")
@@ -414,36 +457,34 @@ torch.set_grad_enabled(False)  # Disable gradient computation
 # Add memory management
 def clear_memory():
     try:
-        global _results
-        current_frame = get_current_frame()
-        if current_frame is not None:
-            temp_frame = current_frame.copy()
-            set_current_frame(None)
-            set_current_frame(temp_frame)
+        global _results, _frame, _frame_width
         
-        # Safely clear results
+        # Clear frame data
+        if _frame is not None:
+            del _frame
+            _frame = None
+        _frame_width = None
+        
+        # Clear results
         if _results is not None:
             del _results
             _results = None
             
+        # Clear CUDA cache if available
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
+        # Force garbage collection
         import gc
         gc.collect()
         
         if IS_RASPBERRY_PI:
             try:
                 os.system('sync')
-                # Only try to write to drop_caches if running as root
-                if os.geteuid() == 0:
-                    with open('/proc/sys/vm/drop_caches', 'w') as f:
-                        f.write('1')
             except:
                 pass
     except Exception as e:
         logger.error(f"Memory cleanup failed: {str(e)}")
-        logger.debug("Current memory state:", exc_info=True)
 
 # Memory monitoring
 def print_memory_usage():
@@ -650,6 +691,10 @@ def _continuous_listen(self):
                     self._play_feedback('command_recognized')
                 elif any(word in command for word in ["clear", "path", "safe distance"]):
                     self.command_queue.put(("action", "clearance"))
+                # Add text recognition commands
+                if any(phrase in command for phrase in ["read text", "read this", "what does it say"]):
+                    self.command_queue.put(("action", "read_text"))
+                    self._play_feedback('command_recognized')
                     
             except (sr.WaitTimeoutError, sr.UnknownValueError):
                 continue
@@ -857,6 +902,286 @@ class AudioManager:
 tts_handler = TTSHandler()
 audio_manager = AudioManager()
 
+class TextRecognitionHandler:
+    def __init__(self):
+        try:
+            self.reader = easyocr.Reader(['en'], gpu=TEXT_RECOGNITION_SETTINGS['gpu'], 
+                                       quantize=True)  # Add quantization for better performance
+            self.last_announcement = 0
+            self.text_cache = set()
+            print("Text recognition initialized successfully")
+        except Exception as e:
+            print(f"Error initializing text recognition: {e}")
+            self.reader = None
+        self.current_reading_position = 0  # Track reading position for book mode
+        self.last_read_text = set()  # Avoid re-reading same text
+
+    def preprocess_frame(self, frame):
+        """Preprocess frame for better text detection"""
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Increase contrast
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(enhanced)
+        return denoised
+
+    def detect_text(self, frame):
+        if self.reader is None:
+            return []
+
+        try:
+            # Preprocess frame
+            processed = self.preprocess_frame(frame)
+            
+            # Detect text in multiple orientations
+            all_texts = []
+            for angle in TEXT_RECOGNITION_SETTINGS['rotation_angles']:
+                if angle != 0:
+                    matrix = cv2.getRotationMatrix2D((frame.shape[1]/2, frame.shape[0]/2), angle, 1)
+                    rotated = cv2.warpAffine(processed, matrix, (frame.shape[1], frame.shape[0]))
+                else:
+                    rotated = processed
+
+                results = self.reader.readtext(rotated)
+                
+                for (bbox, text, prob) in results:
+                    if prob < TEXT_RECOGNITION_SETTINGS['min_confidence']:
+                        continue
+                    
+                    # Filter out very long or very short texts
+                    if len(text) > TEXT_RECOGNITION_SETTINGS['max_text_length'] or len(text) < 2:
+                        continue
+
+                    # Calculate text size
+                    (tl, tr, br, bl) = bbox
+                    width = int(dist.euclidean(tl, tr))
+                    height = int(dist.euclidean(tl, bl))
+                    
+                    if width < TEXT_RECOGNITION_SETTINGS['min_text_size'] or \
+                       height < TEXT_RECOGNITION_SETTINGS['min_text_size']:
+                        continue
+                    
+                    # Rotate coordinates back if needed
+                    if angle != 0:
+                        bbox = np.array(bbox)
+                        bbox = np.hstack((bbox, np.ones((4,1))))
+                        inv_matrix = cv2.getRotationMatrix2D((frame.shape[1]/2, frame.shape[0]/2), -angle, 1)
+                        bbox = np.dot(inv_matrix, bbox.T).T
+
+                    all_texts.append({
+                        'text': text.strip(),
+                        'confidence': prob,
+                        'bbox': bbox,
+                        'center': (int((bbox[0][0] + bbox[2][0])/2), 
+                                 int((bbox[0][1] + bbox[2][1])/2))
+                    })
+
+            # Merge nearby text blocks
+            merged_texts = self.merge_text_blocks(all_texts)
+            return merged_texts
+
+        except Exception as e:
+            print(f"Error in text detection: {e}")
+            return []
+
+    def merge_text_blocks(self, texts):
+        """Merge nearby text blocks for more natural reading"""
+        if not texts:
+            return []
+
+        # Sort by vertical position
+        texts.sort(key=lambda x: x['center'][1])
+        
+        merged = []
+        current_group = [texts[0]]
+        
+        for text in texts[1:]:
+            last = current_group[-1]
+            # Check if text blocks are close enough to merge
+            if (abs(text['center'][1] - last['center'][1]) < 
+                TEXT_RECOGNITION_SETTINGS['block_merge_threshold']):
+                current_group.append(text)
+            else:
+                # Merge current group and start new one
+                merged.append(self.combine_text_blocks(current_group))
+                current_group = [text]
+        
+        # Add last group
+        if current_group:
+            merged.append(self.combine_text_blocks(current_group))
+        
+        return merged
+
+    def combine_text_blocks(self, blocks):
+        """Combine multiple text blocks into one"""
+        if not blocks:
+            return None
+        
+        # Sort blocks by horizontal position
+        blocks.sort(key=lambda x: x['center'][0])
+        
+        # Combine text and average confidence
+        combined_text = " ".join(b['text'] for b in blocks)
+        avg_confidence = sum(b['confidence'] for b in blocks) / len(blocks)
+        
+        # Use bounding box of first and last block
+        bbox = np.array([
+            blocks[0]['bbox'][0],  # Top-left from first block
+            blocks[-1]['bbox'][1],  # Top-right from last block
+            blocks[-1]['bbox'][2],  # Bottom-right from last block
+            blocks[0]['bbox'][3]   # Bottom-left from first block
+        ])
+        
+        return {
+            'text': combined_text,
+            'confidence': avg_confidence,
+            'bbox': bbox,
+            'center': (int((bbox[0][0] + bbox[2][0])/2), 
+                      int((bbox[0][1] + bbox[2][1])/2))
+        }
+
+    def format_text_announcement(self, texts):
+        """Format detected text for natural speech output"""
+        if not texts:
+            return "No text detected"
+        
+        # Sort texts by confidence
+        texts.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        # Prepare announcement
+        lines = []
+        for text in texts:
+            conf_percent = int(text['confidence'] * 100)
+            if conf_percent >= 80:
+                lines.append(text['text'])
+            else:
+                lines.append(f"{text['text']}, confidence {conf_percent}%")
+        
+        return ". ".join(lines)
+
+    def visualize_text(self, frame, texts):
+        """Draw detected text boxes and content on frame"""
+        try:
+            for text_obj in texts:
+                bbox = np.array(text_obj['bbox']).astype(int)
+                
+                # Draw green rectangle
+                cv2.rectangle(frame, 
+                            tuple(bbox[0]), 
+                            tuple(bbox[2]), 
+                            (0, 255, 0), 2)
+                
+                # Add white background for text
+                (text_width, text_height), _ = cv2.getTextSize(
+                    text_obj['text'], 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.5, 2)
+                cv2.rectangle(frame,
+                            (bbox[0][0], bbox[0][1] - text_height - 4),
+                            (bbox[0][0] + text_width, bbox[0][1]),
+                            (255, 255, 255),
+                            -1)
+                
+                # Draw text
+                cv2.putText(frame,
+                           text_obj['text'],
+                           (bbox[0][0], bbox[0][1] - 4),
+                           cv2.FONT_HERSHEY_SIMPLEX,
+                           0.5,
+                           (0, 0, 0),
+                           2)
+                
+                # Show confidence
+                conf_text = f"{int(text_obj['confidence']*100)}%"
+                cv2.putText(frame,
+                           conf_text,
+                           (bbox[0][0], bbox[2][1] + 15),
+                           cv2.FONT_HERSHEY_SIMPLEX,
+                           0.4,
+                           (255, 255, 0),
+                           1)
+        except Exception as e:
+            print(f"Error in text visualization: {e}")
+
+    def detect_book_text(self, frame):
+        """Specialized text detection for book pages"""
+        if self.reader is None:
+            return []
+        
+        try:
+            processed = self.preprocess_frame(frame)
+            
+            # Detect text with focus on book layout
+            results = self.reader.readtext(processed)
+            book_texts = []
+            
+            for (bbox, text, prob) in results:
+                if prob < TEXT_RECOGNITION_SETTINGS['min_confidence']:
+                    continue
+                
+                # Calculate text size
+                (tl, tr, br, bl) = bbox
+                height = int(dist.euclidean(tl, bl))
+                
+                # Filter for book-like text
+                if height < TEXT_RECOGNITION_SETTINGS['book_mode']['min_text_height']:
+                    continue
+                
+                # Add to book texts with position info
+                book_texts.append({
+                    'text': text.strip(),
+                    'confidence': prob,
+                    'bbox': bbox,
+                    'center': (int((tl[0] + br[0])/2), int((tl[1] + br[1])/2)),
+                    'y_position': tl[1]  # Y coordinate for ordering
+                })
+            
+            # Sort by vertical position for natural reading order
+            book_texts.sort(key=lambda x: x['y_position'])
+            return book_texts
+            
+        except Exception as e:
+            print(f"Error in book text detection: {e}")
+            return []
+
+    def format_book_text(self, texts):
+        """Format book text for natural reading"""
+        if not texts:
+            return "No text detected on page"
+        
+        # Combine texts in reading order
+        lines = []
+        current_line = []
+        last_y = None
+        
+        for text in texts:
+            current_y = text['y_position']
+            
+            # Check if this is a new line
+            if last_y is not None and abs(current_y - last_y) > TEXT_RECOGNITION_SETTINGS['book_mode']['line_spacing']:
+                if current_line:
+                    lines.append(' '.join(current_line))
+                    current_line = []
+            
+            current_line.append(text['text'])
+            last_y = current_y
+        
+        # Add last line
+        if current_line:
+            lines.append(' '.join(current_line))
+        
+        return '. '.join(lines)
+
+# Initialize text handler before the main loop (add this before the main loop)
+try:
+    text_recognition = TextRecognitionHandler()
+    print("Text recognition initialized successfully")
+except Exception as e:
+    print(f"Failed to initialize text recognition: {e}")
+    text_recognition = None
+
 # Main loop
 while True:
     try:
@@ -876,9 +1201,26 @@ while True:
             camera = initialize_camera()
             continue
 
-        # Process frame
-        processed_frame = cv2.resize(new_frame, (FRAME_WIDTH, FRAME_HEIGHT))
-        set_current_frame(processed_frame)
+        # Process frame with error handling
+        try:
+            processed_frame = cv2.resize(new_frame, (FRAME_WIDTH, FRAME_HEIGHT))
+            # Convert BGR to RGB
+            processed_frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+            
+            # Run inference with proper error handling
+            if IS_RASPBERRY_PI:
+                _results = model(processed_frame_rgb, verbose=False, conf=0.3, iou=0.5, max_det=MAX_OBJECTS)[0]
+            else:
+                # Ensure frame is in correct format for GPU
+                if torch.cuda.is_available():
+                    _results = model(processed_frame_rgb, verbose=False, conf=0.25, iou=0.45)[0]
+                else:
+                    _results = model(processed_frame_rgb, verbose=False, conf=0.25, iou=0.45)[0]
+            
+            set_current_frame(processed_frame)
+        except Exception as e:
+            logger.error(f"Error in frame processing: {e}")
+            continue
 
         # Add memory status
         mem_status = get_memory_status()
@@ -977,6 +1319,10 @@ while True:
             if command_type == "mode":
                 current_mode = command_value
                 tts_handler.say(f"Switching to {command_value} mode")
+                if command_value == "read":
+                    voice_handler.read_mode_active = True
+                else:
+                    voice_handler.read_mode_active = False
             elif command_type == "action" and command_value == "describe":
                 announcement = ", ".join(detected_speech)
                 tts_handler.say(announcement)
@@ -993,6 +1339,76 @@ while True:
                 
                 announcement = ". ".join(clear_paths)
                 tts_handler.say(announcement)
+            elif command_type == "action" and command_value == "read_text":
+                # Process text recognition immediately
+                if text_recognition is None:
+                    tts_handler.say("Text recognition is not available")
+                    continue
+                
+                try:
+                    detected_texts = text_recognition.detect_text(processed_frame)
+                    if detected_texts:
+                        text_recognition.visualize_text(processed_frame, detected_texts)
+                        announcement = text_recognition.format_text_announcement(detected_texts)
+                        tts_handler.say(announcement)
+                        # Start continuous reading mode if requested
+                        voice_handler.read_mode_active = True
+                        text_recognition.last_announcement = current_time
+                    else:
+                        tts_handler.say("No text detected")
+                except Exception as e:
+                    logger.error(f"Error processing text: {e}")
+                    tts_handler.say("Error processing text")
+                    continue
+
+        # Handle read mode with proper error handling
+        if current_mode == "read" and voice_handler.read_mode_active:
+            try:
+                if text_recognition is None:
+                    tts_handler.say("Text recognition is not available")
+                    voice_handler.read_mode_active = False
+                    continue
+
+                current_time = time.time()
+                if current_time - text_recognition.last_announcement > TEXT_RECOGNITION_SETTINGS['announcement_cooldown']:
+                    detected_texts = text_recognition.detect_text(processed_frame)
+                    if detected_texts:
+                        text_recognition.visualize_text(processed_frame, detected_texts)
+                        announcement = text_recognition.format_text_announcement(detected_texts)
+                        tts_handler.say(announcement)
+                        text_recognition.last_announcement = current_time
+            except Exception as e:
+                logger.error(f"Error in read mode: {e}")
+                continue
+
+        # Handle book reading mode
+        if current_mode == "book" and voice_handler.read_mode_active:
+            try:
+                if text_recognition is None:
+                    tts_handler.say("Text recognition is not available")
+                    voice_handler.read_mode_active = False
+                    continue
+                
+                current_time = time.time()
+                if current_time - text_recognition.last_announcement > TEXT_RECOGNITION_SETTINGS['announcement_cooldown']:
+                    # Detect text specifically formatted for books
+                    book_texts = text_recognition.detect_book_text(processed_frame)
+                    if book_texts:
+                        text_recognition.visualize_text(processed_frame, book_texts)
+                        announcement = text_recognition.format_book_text(book_texts)
+                        # Only announce if text has changed
+                        if announcement not in text_recognition.last_read_text:
+                            tts_handler.say(announcement)
+                            text_recognition.last_read_text.add(announcement)
+                            text_recognition.last_announcement = current_time
+                    else:
+                        if current_time - text_recognition.last_announcement > 5.0:
+                            tts_handler.say("Please show a book page")
+                            text_recognition.last_announcement = current_time
+                            
+            except Exception as e:
+                logger.error(f"Error in book reading mode: {e}")
+                continue
 
         # Handle navigation mode
         if current_mode == "navigation":
@@ -1094,7 +1510,7 @@ while True:
             # Draw path zones
             cv2.rectangle(processed_frame, 
                          (int(start), 0),
-                         (int(end), processed_frame.shape[0]),
+                         (int(end), processed_frame.shape[0]), 
                          (0, 255, 0, 0.3),  # Green with transparency
                          2)
 
